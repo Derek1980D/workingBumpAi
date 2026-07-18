@@ -1,124 +1,121 @@
-#!/usr/bin/env python3
-"""
-Generate height / normal / AO maps for pseudo-3D relighting from a single image.
+# Pseudo-3D Relighting Demo
 
-Usage:
-    python3 generate-maps.py input.png output_dir/ [--autocrop] [--maxdim 720]
-"""
-import argparse
-import os
+A single-file WebGL page that fakes real-time 3D lighting on a flat 2D image.
+Normal maps and ambient-occlusion maps are derived from (or authored
+alongside) the source image, then used to shade it per-pixel with a light
+you can move around. Two tests live in one page, switchable from a dropdown.
 
-import numpy as np
-from PIL import Image, ImageFilter
+- **Relic Pedestal** — a photographed/rendered object relit by a glowing
+  marble you drag around. Pinch with two fingers to zoom/pan; one finger
+  still just moves the marble.
+- **Conduit** — a procedurally-authored pixel-art panel with a channel loop
+  cut into it. A glowing ball rolls the loop on its own, lighting the groove
+  as it passes, trailing a fading glow and flame behind it. One finger pans,
+  two fingers pinch-zoom.
 
+## Getting this onto GitHub Pages
 
-def autocrop_ui_bars(img, thresh=10.0):
-    """Strip pure-black letterboxing/UI bars by finding the tallest
-    contiguous run of rows brighter than `thresh`."""
-    arr = np.array(img).astype(np.float32)
-    row_brightness = arr.mean(axis=(1, 2))
-    mask = row_brightness > thresh
+1. Create a new repo (or open an existing one).
+2. Upload the **contents** of this folder to the repo root — `index.html`
+   needs to sit at the top level, not inside a subfolder. Dragging the whole
+   extracted folder into GitHub's "Add file → Upload files" page in a
+   desktop browser preserves the `assets/`/`scripts/` structure in one go.
+3. Commit to `main`.
+4. In the repo's **Settings → Pages**, set Source to "Deploy from a branch",
+   branch `main`, folder `/ (root)`, then save.
+5. The demo goes live at `https://<username>.github.io/<repo-name>/`
+   within a minute or two.
 
-    runs = []
-    start = None
-    for i, v in enumerate(mask):
-        if v and start is None:
-            start = i
-        if (not v) and start is not None:
-            runs.append((start, i))
-            start = None
-    if start is not None:
-        runs.append((start, len(mask)))
-    if not runs:
-        return img
+Nothing else needs configuring — `index.html` has every texture baked in as
+base64, so it doesn't reach into `assets/` at runtime. That folder is there
+for your own reference/reuse, not because the page depends on it.
 
-    top, bottom = max(runs, key=lambda r: r[1] - r[0])
-    return img.crop((0, top, img.width, bottom))
+## Folder layout
 
+```
+pseudo3d-relighting/
+├── index.html                    ← the demo — this is what Pages serves
+├── README.md
+├── assets/
+│   ├── diffuse.png                Relic Pedestal's source image
+│   ├── height-map.png             its height field
+│   ├── normal-map.png             its normal map
+│   ├── light-map.png              its ambient occlusion
+│   ├── diffuse-conduit.png        Conduit's pixel-art panel (native 128×128)
+│   ├── height-map-conduit.png     its authored height field
+│   ├── normal-conduit.png         its normal map
+│   └── light-map-conduit.png      packed RGBA: AO / ambient-glow mask /
+│                                  track-progress / loop-only mask
+└── scripts/
+    ├── generate-maps.py           regenerate Relic Pedestal's maps from any photo
+    └── generate-conduit-scene.py  regenerate Conduit's maps, channel shape as CLI flags
+```
 
-def sobel_xy(h):
-    kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
-    ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
-    padded = np.pad(h, 1, mode='edge')
-    hh, ww = h.shape
-    gx = np.zeros_like(h)
-    gy = np.zeros_like(h)
-    for dy in range(3):
-        for dx in range(3):
-            gx += kx[dy, dx] * padded[dy:dy+hh, dx:dx+ww]
-            gy += ky[dy, dx] * padded[dy:dy+hh, dx:dx+ww]
-    return gx, gy
+## Controls
 
+**Relic Pedestal**
+- Drag to move the light, or tap **Orbit** to let it sweep automatically
+- **Relief** — exaggerates or flattens the bump effect
+- **Glow** — recolors the pulse in the carved lines
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('input')
-    ap.add_argument('outdir')
-    ap.add_argument('--autocrop', action='store_true',
-                     help='strip pure-black UI bars (phone screenshots)')
-    ap.add_argument('--maxdim', type=int, default=720,
-                     help='resize so the longest edge is at most this many px')
-    ap.add_argument('--blur', type=float, default=2.0,
-                     help='height map denoise blur radius')
-    ap.add_argument('--ao-blur', type=float, default=16.0,
-                     help='AO neighbourhood blur radius')
-    args = ap.parse_args()
+**Conduit**
+- **Roll** — play/pause the ball's loop
+- Same **Relief** and **Glow** controls, which also tint the ball, its trail,
+  and the flame
 
-    img = Image.open(args.input).convert('RGB')
-    if args.autocrop:
-        img = autocrop_ui_bars(img)
+Both scenes: pinch to zoom, drag with two fingers to pan, **Reset** in the
+corner returns to the default view.
 
-    w, h = img.size
-    scale = args.maxdim / max(w, h)
-    if scale < 1:
-        img = img.resize((round(w * scale), round(h * scale)), Image.LANCZOS)
-    W, H = img.size
+## How it works
 
-    gray = img.convert('L').filter(ImageFilter.GaussianBlur(radius=args.blur))
-    height_arr = np.array(gray).astype(np.float32) / 255.0
+**Relic Pedestal**: grayscale luminance from the photo stands in for a
+height map. A Sobel filter over that gives the local slope, which becomes a
+per-pixel normal (`normal = normalize(-slope_x, slope_y, 1)`, encoded as RGB).
+There's no mesh here, so no UV-unwrapping step — the image *is* the UV space.
 
-    gx, gy = sobel_xy(height_arr)
-    allmag = np.abs(np.concatenate([gx.ravel(), gy.ravel()]))
-    p995 = np.percentile(allmag, 99.5)
-    strength = 0.9 / max(p995, 1e-6)
+**Conduit** is authored differently: rather than deriving height from a
+photo, `generate-conduit-scene.py` builds it from signed-distance-field
+math — the channel is "distance to a rounded rectangle's outline," carved
+into a flat base height with a smooth falloff. The ball's path in the HTML
+(`pointOnTrack()`) walks that exact same rounded rectangle, so it always
+sits precisely on the channel, not just visually close to it. Textures are
+kept at native 128×128 and loaded with `NEAREST` filtering rather than
+`LINEAR`, which is what actually produces the pixel-art blockiness (and
+keeps the files tiny).
 
-    # nx: image-x (rightward) matches world-x directly.
-    # ny: array rows increase downward but world-y is up, hence the sign flip.
-    nx = -gx * strength
-    ny = gy * strength
-    nz = np.ones_like(height_arr)
-    vlen = np.sqrt(nx**2 + ny**2 + nz**2)
-    nx /= vlen
-    ny /= vlen
-    nz /= vlen
+**The trail** reuses that same track parametrization rather than tracking a
+history of past ball positions: every pixel near the loop has its own
+"nearest point on the track" progress value baked into the texture (0–1
+around the loop). Comparing that to the ball's current progress gives an
+exact "how long ago was this point passed" value, which drives an
+exponential fade — cheaper and more precise than the usual position-history
+approach, since the geometry is known up front.
 
-    normal_rgb = np.stack(
-        [(nx * 0.5 + 0.5) * 255, (ny * 0.5 + 0.5) * 255, (nz * 0.5 + 0.5) * 255],
-        axis=-1,
-    )
-    normal_rgb = np.clip(normal_rgb, 0, 255).astype(np.uint8)
+**The flame** is layered noise (`fbm`, four octaves of value noise) scrolled
+upward over time and masked to that same fading trail region, colored on a
+dark-red-to-white ramp.
 
-    wide = np.array(
-        Image.fromarray((height_arr * 255).astype(np.uint8))
-        .filter(ImageFilter.GaussianBlur(radius=args.ao_blur))
-    ).astype(np.float32) / 255.0
-    delta = height_arr - wide
-    dscale = 3.2 / (np.percentile(np.abs(delta), 99.5) + 1e-6)
-    ao = np.clip(0.55 + delta * dscale * 0.55, 0.15, 1.15)
-    ao = ao / ao.max()
+Shared logic — the pan/zoom transform, the Lambertian+specular lighting, the
+glowing-orb effect used for both the marble and the ball — lives once in a
+handful of GLSL string constants that get concatenated into each scene's
+shader, rather than being copy-pasted per scene. GLSL has no `#include`, so
+this is the standard way around that once more than one or two shaders need
+the same logic.
 
-    os.makedirs(args.outdir, exist_ok=True)
-    img.save(os.path.join(args.outdir, 'diffuse.png'), optimize=True)
-    Image.fromarray((height_arr * 255).astype(np.uint8), 'L').save(
-        os.path.join(args.outdir, 'height-map.png'), optimize=True)
-    Image.fromarray(normal_rgb, 'RGB').save(
-        os.path.join(args.outdir, 'normal-map.png'), optimize=True)
-    Image.fromarray((ao * 255).astype(np.uint8), 'L').save(
-        os.path.join(args.outdir, 'light-map.png'), optimize=True)
+## Regenerating the maps
 
-    print(f'Wrote diffuse / height-map / normal-map / light-map.png '
-          f'to {args.outdir}  ({W}x{H})')
+```
+python3 scripts/generate-maps.py your-photo.png output-folder/ --autocrop
+python3 scripts/generate-conduit-scene.py output-folder/ --hw 0.68 --hh 0.50 --radius 0.20
+```
 
+`--autocrop` strips pure-black phone-screenshot UI bars. If you resize
+Conduit's channel with `--hw`/`--hh`/`--radius`, update the matching `TRACK`
+constant in `index.html`'s script so the ball keeps following the new shape.
+Baking a fresh set of PNGs into a new self-contained `index.html` for either
+scene is a quick follow-up — just ask.
 
-if __name__ == '__main__':
-    main()
+## Notes on the repo itself
+
+Everything here is plain text and PNGs — nothing big enough to need Git LFS
+(a few MB all in). No build step, no dependencies, no `node_modules`.
