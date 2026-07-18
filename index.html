@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""
+Procedurally generate a pixel-art "energy conduit" scene: a flat panel with a
+rounded-rectangle channel loop (plus two spurs) carved into it, along with the
+height / normal / AO+glow-mask maps needed to relight it in the WebGL demo.
+
+Unlike generate-maps.py (which derives maps from an existing photo/render),
+this authors the height field directly from signed-distance-field math, so
+the channel geometry is exact and can be resized/reshaped with no re-tracing.
+
+Usage:
+    python3 generate-conduit-scene.py output_dir/ [--res 128] [--hw 0.68] [--hh 0.50] [--radius 0.20]
+
+If you change --hw / --hh / --radius, update the matching TRACK constant in
+the demo HTML's <script> block so the ball keeps following the new channel.
+"""
+import argparse
+import os
+
+import numpy as np
+from PIL import Image, ImageFilter
+
+
+def sdf_round_rect_outline(x, y, hw, hh, r):
+    qx = np.abs(x) - (hw - r)
+    qy = np.abs(y) - (hh - r)
+    outside = np.sqrt(np.clip(qx, 0, None)**2 + np.clip(qy, 0, None)**2) + np.clip(np.maximum(qx, qy), None, 0) - r
+    return np.abs(outside)
+
+
+def sdf_segment(x, y, ax, ay, bx, by):
+    pax, pay = x - ax, y - ay
+    bax, bay = bx - ax, by - ay
+    h = np.clip((pax * bax + pay * bay) / (bax * bax + bay * bay), 0, 1)
+    dx = pax - bax * h
+    dy = pay - bay * h
+    return np.sqrt(dx * dx + dy * dy)
+
+
+def sobel_xy(h):
+    kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=np.float32)
+    ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=np.float32)
+    padded = np.pad(h, 1, mode='edge')
+    hh_, ww_ = h.shape
+    gx = np.zeros_like(h)
+    gy = np.zeros_like(h)
+    for dy in range(3):
+        for dx in range(3):
+            gx += kx[dy, dx] * padded[dy:dy+hh_, dx:dx+ww_]
+            gy += ky[dy, dx] * padded[dy:dy+hh_, dx:dx+ww_]
+    return gx, gy
+
+
+def seam_mask(coord_px, period=16, width=0.7):
+    m = coord_px % period
+    d = np.minimum(m, period - m)
+    return d < width
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument('outdir')
+    ap.add_argument('--res', type=int, default=128, help='native pixel-art resolution (square)')
+    ap.add_argument('--hw', type=float, default=0.68, help='track half-width, in -1..1 plane space')
+    ap.add_argument('--hh', type=float, default=0.50, help='track half-height')
+    ap.add_argument('--radius', type=float, default=0.20, help='track corner radius')
+    ap.add_argument('--channel-width', type=float, default=0.045, help='channel half-width (groove size)')
+    args = ap.parse_args()
+
+    N = args.res
+    HW, HH, R = args.hw, args.hh, args.radius
+    CHANNEL_HW = args.channel_width
+    GLOW_HW = CHANNEL_HW * 1.7
+
+    ys, xs = np.mgrid[0:N, 0:N]
+    X = (xs / (N - 1)) * 2 - 1
+    Y = -((ys / (N - 1)) * 2 - 1)  # y-up, matches the demo's world convention
+
+    d_loop = sdf_round_rect_outline(X, Y, HW, HH, R)
+    d_spurA = sdf_segment(X, Y, -HW, 0.0, -0.85, 0.15)
+    d_spurB = sdf_segment(X, Y, 0.0, -HH, 0.15, -0.80)
+    channel_dist = np.minimum(np.minimum(d_loop, d_spurA), d_spurB)
+
+    seam_x = seam_mask((X * 0.5 + 0.5) * (N - 1))
+    seam_y = seam_mask((Y * 0.5 + 0.5) * (N - 1))
+    seam = seam_x | seam_y
+
+    base_height = 0.62
+    groove = (1.0 - np.clip(channel_dist / CHANNEL_HW, 0, 1)) ** 1.5
+    depth = 0.30
+    seam_dip = np.where(seam, 0.02, 0.0)
+    height_arr = np.clip(base_height - depth * groove - seam_dip, 0, 1)
+
+    gx, gy = sobel_xy(height_arr)
+    allmag = np.abs(np.concatenate([gx.ravel(), gy.ravel()]))
+    p995 = np.percentile(allmag, 99.5)
+    strength = 0.85 / max(p995, 1e-6)
+
+    nx = -gx * strength
+    ny = gy * strength  # sign-corrected: array rows increase downward, world-y is up
+    nz = np.ones_like(height_arr)
+    vlen = np.sqrt(nx**2 + ny**2 + nz**2)
+    nx /= vlen
+    ny /= vlen
+    nz /= vlen
+    normal_rgb = np.clip(
+        np.stack([(nx*0.5+0.5)*255, (ny*0.5+0.5)*255, (nz*0.5+0.5)*255], axis=-1), 0, 255
+    ).astype(np.uint8)
+
+    panel_color = np.array([61, 65, 72], dtype=np.float32)
+    seam_color = np.array([52, 56, 62], dtype=np.float32)
+    channel_color = np.array([22, 25, 30], dtype=np.float32)
+    rim_color = np.array([112, 118, 125], dtype=np.float32)
+
+    base = np.where(seam[..., None], seam_color, panel_color)
+    channel_fill = (1.0 - np.clip(channel_dist / CHANNEL_HW, 0, 1)) ** 1.2
+    rim_band = np.exp(-((channel_dist - CHANNEL_HW) ** 2) / (2 * (0.012 ** 2)))
+
+    diffuse_f = base * (1 - channel_fill[..., None]) + channel_color * channel_fill[..., None]
+    diffuse_f = diffuse_f + rim_color * rim_band[..., None] * 0.55
+
+    riv_x = seam_mask((X * 0.5 + 0.5) * (N - 1), width=1.2)
+    riv_y = seam_mask((Y * 0.5 + 0.5) * (N - 1), width=1.2)
+    rivet = riv_x & riv_y & (channel_fill < 0.3)
+    diffuse_f = np.where(rivet[..., None], diffuse_f * 0.7, diffuse_f)
+    diffuse_arr = np.clip(diffuse_f, 0, 255).astype(np.uint8)
+
+    wide = np.array(
+        Image.fromarray((height_arr * 255).astype(np.uint8)).filter(ImageFilter.GaussianBlur(radius=6))
+    ).astype(np.float32) / 255.0
+    delta = height_arr - wide
+    dscale = 3.0 / (np.percentile(np.abs(delta), 99.5) + 1e-6)
+    ao = np.clip(0.55 + delta * dscale * 0.55, 0.15, 1.15)
+    ao = ao / ao.max()
+
+    channel_glow_mask = (1.0 - np.clip(channel_dist / GLOW_HW, 0, 1)) ** 1.3
+    aux_rgb = np.clip(
+        np.stack([ao * 255, channel_glow_mask * 255, np.zeros_like(ao)], axis=-1), 0, 255
+    ).astype(np.uint8)
+
+    os.makedirs(args.outdir, exist_ok=True)
+    Image.fromarray(diffuse_arr, 'RGB').save(os.path.join(args.outdir, 'diffuse-conduit.png'), optimize=True)
+    Image.fromarray((height_arr * 255).astype(np.uint8), 'L').save(
+        os.path.join(args.outdir, 'height-map-conduit.png'), optimize=True)
+    Image.fromarray(normal_rgb, 'RGB').save(os.path.join(args.outdir, 'normal-conduit.png'), optimize=True)
+    Image.fromarray(aux_rgb, 'RGB').save(os.path.join(args.outdir, 'light-map-conduit.png'), optimize=True)
+
+    print(f'Wrote diffuse/height-map/normal/light-map-conduit.png to {args.outdir} '
+          f'({N}x{N}, hw={HW} hh={HH} r={R})')
+    print('Native resolution, no upscaling — load with gl.NEAREST filtering for crisp pixel art.')
+
+
+if __name__ == '__main__':
+    main()
